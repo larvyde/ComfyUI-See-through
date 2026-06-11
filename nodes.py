@@ -941,11 +941,11 @@ class SeeThrough_SaveORA:
 
             # Write the workflow
             if extra_pnginfo is not None and "workflow" in extra_pnginfo:
-                zf.writestr("workflow.json", json.dumps(extra_pnginfo["workflow"]))
+                zf.writestr("workflow.json", json.dumps(extra_pnginfo["workflow"], indent=2))
 
             metadata = [
                 '<?xml version="1.0" encoding="UTF-8"?>',
-                f'  <image version="0.0.3" w="{canvas_w}" h="{canvas_h}">',
+                f'<image version="0.0.3" w="{canvas_w}" h="{canvas_h}">',
                 '  <stack>'
             ]
 
@@ -986,7 +986,6 @@ class SeeThrough_SaveORA:
 
         # Save a temp file for preview
         temp_dir = folder_paths.get_temp_directory()
-        print(f"[SeeThrough] Temp directory: {temp_dir}", flush=True)
 
         temp_filename = f"{str(uuid.uuid4())}_preview.png"
         temp_path = os.path.join(temp_dir, temp_filename)

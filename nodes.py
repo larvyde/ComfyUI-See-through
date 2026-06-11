@@ -1,8 +1,11 @@
+import io
+import json
 import os
 import sys
 import random
 import uuid
 from datetime import datetime
+import zipfile
 
 print("[SeeThrough] nodes.py: starting imports...", flush=True)
 
@@ -11,7 +14,7 @@ import numpy as np
 
 import folder_paths
 import comfy.model_management as mm
-import comfy.utils
+from PIL import Image
 
 
 def _log_vram(label):
@@ -873,6 +876,134 @@ class SeeThrough_PostProcess:
         preview = _make_preview(tag2pinfo, resolution)
         return (parts_data, preview)
 
+def save_to_zip(zip, filename, img_pil, compress_level=4):
+    img_bytes = io.BytesIO()
+    img_pil.save(img_bytes, format="PNG", compress_level=compress_level)
+    img_bytes.seek(0)
+    zip.writestr(filename, img_bytes.read())
+
+class SeeThrough_SaveORA:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "parts": ("SEETHROUGH_PARTS",),
+                "preview": ("IMAGE",),
+                "filename_prefix": ("STRING", {"default": "SeeThrough"}),
+                "save_depth": ("BOOLEAN", {"default": False}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save"
+    CATEGORY = "SeeThrough"
+    OUTPUT_NODE = True
+
+    def save(self, parts, preview, filename_prefix="SeeThrough", save_depth=False, prompt=None, extra_pnginfo=None):
+        # Extract the parts dictionary containing tag-to-part-info mapping and canvas dimensions
+        tag2pinfo = parts["tag2pinfo"]  # Dictionary mapping body part tags to their info (img, depth, xyxy, etc.)
+        frame_size = parts["frame_size"]  # Tuple containing (height, width) of the canvas
+        canvas_h, canvas_w = frame_size
+
+        sorted_tags = sorted(tag2pinfo.keys(), key=lambda t: tag2pinfo[t].get("depth_median", 1))
+
+        full_output_folder, filename, counter, subfolder, filename_prefix = \
+            folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory(), canvas_w, canvas_h)
+
+        zip_path = os.path.join(full_output_folder, f"{filename}_{counter:05}_.ora")
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Write mimetype first, uncompressed
+            mimetype_info = zipfile.ZipInfo("mimetype")
+            mimetype_info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(mimetype_info, "image/openraster")
+
+            # Write the source image and thumbnail
+            src_image_pil = Image.fromarray(np.clip(preview[0].cpu().numpy() * 255, 0, 255).astype(np.uint8))
+            if src_image_pil.mode not in ("RGBA", "RGB"):
+                src_image_pil = src_image_pil.convert("RGB")
+            save_to_zip(zf, "mergedimage.png", src_image_pil)
+
+            sw, sh = src_image_pil.size
+            scale = min(256 / sw, 256 / sh, 1.0)
+            if scale < 1.0:
+                thumb_w = max(1, round(sw * scale))
+                thumb_h = max(1, round(sh * scale))
+                thumb_image_pil = src_image_pil.resize((thumb_w, thumb_h), resample=Image.LANCZOS)
+            else:
+                thumb_image_pil = src_image_pil
+
+            save_to_zip(zf, "Thumbnails/thumbnail.png", thumb_image_pil)
+
+            # Write the workflow
+            if extra_pnginfo is not None and "workflow" in extra_pnginfo:
+                zf.writestr("workflow.json", json.dumps(extra_pnginfo["workflow"]))
+
+            metadata = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                f'  <image version="0.0.3" w="{canvas_w}" h="{canvas_h}">',
+                '  <stack>'
+            ]
+
+            for tag in sorted_tags:
+                # Get the part information dictionary for the current tag
+                pinfo = tag2pinfo[tag]
+                
+                # Extract the image (RGBA numpy array) and optional depth map for this part
+                img = pinfo.get("img")
+                depth = pinfo.get("depth")
+                
+                # Skip this layer if no image data exists
+                if img is None:
+                    continue
+
+                # Get the bounding box coordinates (x1, y1, x2, y2) for layer positioning
+                # Default to full image dimensions if not specified
+                xyxy = pinfo.get("xyxy", [0, 0, img.shape[1], img.shape[0]])
+                x1, y1, x2, y2 = [int(v) for v in xyxy]
+
+                layer_filename = f"data/{tag}.png"
+                save_to_zip(zf, layer_filename, Image.fromarray(img))
+                metadata.append(f'    <layer name="{tag}" src="{layer_filename}" x="{x1}" y="{y1}" visibility="visible"/>')
+
+                if save_depth and (depth is not None):
+                    depth_filename = f"data/{tag}_depth.png"
+
+                    if depth.ndim == 2:
+                        save_to_zip(zf, depth_filename, Image.fromarray(depth, mode="L"))
+                    else:
+                        save_to_zip(zf, depth_filename, Image.fromarray(depth))
+
+                    metadata.append(f'    <layer name="{tag}" src="{depth_filename}" x="{x1}" y="{y1}" visibility="hidden"/>')
+            
+            metadata.append('  </stack>')
+            metadata.append('</image>')
+            zf.writestr("stack.xml", "\n".join(metadata))
+
+        # Save a temp file for preview
+        temp_dir = folder_paths.get_temp_directory()
+        print(f"[SeeThrough] Temp directory: {temp_dir}", flush=True)
+
+        temp_filename = f"{str(uuid.uuid4())}_preview.png"
+        temp_path = os.path.join(temp_dir, temp_filename)
+        
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+            src_image_pil.save(temp_path, format="PNG", compress_level=9)
+        except Exception as e:
+            print(f"[SeeThrough] ERROR saving temp preview image: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+        return {"ui": {"images": [{
+            "filename": temp_filename,
+            "subfolder": "",
+            "type": "temp"
+        }]}}
 
 class SeeThrough_SavePSD:
     @classmethod
@@ -953,6 +1084,7 @@ NODE_CLASS_MAPPINGS = {
     "SeeThrough_GenerateDepth": SeeThrough_GenerateDepth,
     "SeeThrough_PostProcess": SeeThrough_PostProcess,
     "SeeThrough_SavePSD": SeeThrough_SavePSD,
+    "SeeThrough_SaveORA": SeeThrough_SaveORA,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -962,4 +1094,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeeThrough_GenerateDepth": "SeeThrough Generate Depth",
     "SeeThrough_PostProcess": "SeeThrough Post Process",
     "SeeThrough_SavePSD": "SeeThrough Save PSD",
+    "SeeThrough_SaveORA": "SeeThrough Save ORA",
 }
